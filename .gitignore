@@ -1,0 +1,18 @@
+# 环境密钥文件
+.env
+
+# python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 虚拟环境
+venv/
+.venv/
+
+# uvicorn、日志
+*.log
+
+# sqlite数据库文件（如果你用sqlite）
+*.db
