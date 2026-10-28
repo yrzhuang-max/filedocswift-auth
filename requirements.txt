@@ -7,4 +7,4 @@ python-jose[cryptography]
 pydantic-settings
 email-validator
 sqlalchemy
-psycopg2-binary
+psycopg[binary]
