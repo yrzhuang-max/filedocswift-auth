@@ -6,3 +6,4 @@ python-jose[cryptography]
 passlib
 requests
 python-multipart
+email-validator
