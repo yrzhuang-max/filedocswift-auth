@@ -1,49 +1,52 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import Optional
-import httpx
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, func
-from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+import requests
+from jose import JWTError, jwt
 from passlib.context import CryptContext
+from datetime import datetime, timedelta
+import os
 
-
-# ========== 配置：pydantic-settings 读取环境变量 ==========
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=None)
-    hcaptcha_secret: str
-    database_url: str
-
-settings = Settings()
-
-
-# ========== Postgres 数据库初始化 ==========
-engine = create_engine(settings.database_url)
+# ===================== 配置 =====================
+SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL")
+engine = create_engine(SQLALCHEMY_DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "CHANGE_ME_TO_LONG_RANDOM_STRING")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 1天
+HCAPTCHA_SECRET = os.getenv("HCAPTCHA_SECRET")
 
-# ========== 密码加密工具 ==========
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-def hash_password(plain_password: str) -> str:
-    return pwd_context.hash(plain_password)
 
+app = FastAPI()
 
-# ========== 用户模型 ==========
-class DBUser(Base):
+# CORS 配置，改成你的前端域名
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://filedocswift.com",
+        "http://localhost:3000"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ===================== 数据库 Model =====================
+class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
-    created_at = Column(DateTime, default=func.now())
 
-
-# 启动自动建表
 Base.metadata.create_all(bind=engine)
 
-
-# ========== 数据库依赖 ==========
+# ===================== DB 依赖 =====================
 def get_db():
     db = SessionLocal()
     try:
@@ -51,63 +54,111 @@ def get_db():
     finally:
         db.close()
 
-
-# ========== 异步 hCaptcha 校验（httpx异步） ==========
-async def verify_hcaptcha(token: str):
-    if not token:
-        raise HTTPException(status_code=400, detail="Please complete hCaptcha")
-    payload = {
-        "secret": settings.hcaptcha_secret,
-        "response": token,
-    }
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post("https://hcaptcha.com/siteverify", data=payload)
-    res_json = resp.json()
-    if not res_json.get("success"):
-        raise HTTPException(status_code=400, detail="hCaptcha verification failed")
-
-
-# ========== FastAPI 实例 ==========
-app = FastAPI(title="FileDocSwift Auth API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://filedocswift.com",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000"
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# ========== 路由 ==========
-router = APIRouter(prefix="/api/auth", tags=["auth"])
-
+# ===================== Pydantic Schema =====================
 class RegisterSchema(BaseModel):
     email: EmailStr
     password: str
-    hcaptchaToken: Optional[str] = None
+    hcaptchaToken: str
 
+class LoginSchema(BaseModel):
+    email: EmailStr
+    password: str
+    hcaptchaToken: str
 
-@router.post("/register")
-async def register(req: RegisterSchema, db: Session = Depends(get_db)):
-    await verify_hcaptcha(req.hcaptchaToken)
-
-    exist_user = db.query(DBUser).filter(DBUser.email == req.email).first()
-    if exist_user:
-        raise HTTPException(status_code=400, detail="Email already registered.")
-
-    new_user = DBUser(
-        email=req.email,
-        hashed_password=hash_password(req.password)
+# ===================== 鉴权依赖（从Cookie读取token） =====================
+def get_current_user(db: Session = Depends(get_db), request: Request = None):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail={"msg": "Not logged in"}
     )
+    token = request.cookies.get("access_token")
+    if not token:
+        raise credentials_exception
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    user = db.query(User).filter(User.id == int(user_id)).first()
+    if user is None:
+        raise credentials_exception
+    return user
+
+# ===================== 接口 =====================
+@app.post("/api/auth/register")
+def register(req: RegisterSchema, db: Session = Depends(get_db)):
+    # hCaptcha verify
+    verify_url = "https://api.hcaptcha.com/siteverify"
+    cap_resp = requests.post(verify_url, data={
+        "secret": HCAPTCHA_SECRET,
+        "response": req.hcaptchaToken
+    })
+    cap_result = cap_resp.json()
+    if not cap_result.get("success"):
+        raise HTTPException(status_code=400, detail={"msg": "hCaptcha verification failed"})
+
+    # 邮箱是否已存在
+    exist_user = db.query(User).filter(User.email == req.email).first()
+    if exist_user:
+        raise HTTPException(status_code=400, detail={"msg": "Email already registered."})
+
+    hashed_pw = pwd_context.hash(req.password)
+    new_user = User(email=req.email, hashed_password=hashed_pw)
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
     return {"msg": "Register success, user saved in database."}
 
 
-app.include_router(router)
+@app.post("/api/auth/login")
+def login(req: LoginSchema, db: Session = Depends(get_db)):
+    # hCaptcha verify
+    verify_url = "https://api.hcaptcha.com/siteverify"
+    cap_resp = requests.post(verify_url, data={
+        "secret": HCAPTCHA_SECRET,
+        "response": req.hcaptchaToken
+    })
+    cap_result = cap_resp.json()
+    if not cap_result.get("success"):
+        raise HTTPException(status_code=400, detail={"msg": "hCaptcha verification failed"})
+
+    user = db.query(User).filter(User.email == req.email).first()
+    if not user or not pwd_context.verify(req.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail={"msg": "Email or password incorrect"})
+
+    # build JWT
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    payload = {"sub": str(user.id), "email": user.email, "exp": expire}
+    token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+    response = Response(content='{"msg":"Login success"}', media_type="application/json")
+    response.set_cookie(
+        key="access_token",
+        value=token,
+        httponly=True,
+        secure=True,          # Render HTTPS打开；本地调试改成 secure=False
+        samesite="lax",
+        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        path="/"
+    )
+    return response
+
+
+@app.post("/api/auth/logout")
+def logout():
+    response = Response(content='{"msg":"Logout success"}', media_type="application/json")
+    response.delete_cookie("access_token", path="/")
+    return response
+
+
+@app.get("/api/auth/me")
+def get_me(current_user: User = Depends(get_current_user)):
+    return {
+        "msg": "ok",
+        "user": {
+            "id": current_user.id,
+            "email": current_user.email
+        }
+    }
