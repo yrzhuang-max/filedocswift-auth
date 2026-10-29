@@ -158,7 +158,7 @@ def get_current_user(db: Session, token: str):
 @app.post("/api/auth/register")
 async def register(req: RegisterReq, db: Session = Depends(get_db)):
     await verify_hcaptcha(req.hcaptchaToken)
-    existing = db.query(DBUser)..filter(DBUser.email == req.email).first()
+    existing = db.query(DBUser).filter(DBUser.email == req.email).first()
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
     hashed = get_password_hash(req.password)
