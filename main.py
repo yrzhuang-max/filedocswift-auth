@@ -185,7 +185,7 @@ async def login(req: LoginReq, res: Response, db: Session = Depends(get_db)):
         value=access_token,
         httponly=True,
         secure=True,
-        samesite="lax",
+        samesite="none",
         max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
     )
     return {"msg": "Login success"}
