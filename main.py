@@ -6,7 +6,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 import httpx
 from jose import JWTError, jwt
-from passlib.context import CryptContext
+import bcrypt
 from datetime import datetime, timedelta
 import os
 import uuid
@@ -24,8 +24,6 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24h
 HCAPTCHA_SECRET = os.getenv("HCAPTCHA_SECRET")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 EMAIL_FROM = os.getenv("EMAIL_FROM")
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 app = FastAPI()
 
@@ -87,12 +85,16 @@ class ResetConfirmReq(BaseModel):
     token: str
     password: str
 
-# ===================== 工具函数 =====================
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
+# ===================== 工具函数（原生bcrypt，移除passlib） =====================
+def get_password_hash(password: str) -> str:
+    # bcrypt 限制最多72字节，自动截断
+    pw_bytes = password.encode("utf-8")[:72]
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(pw_bytes, salt).decode("utf-8")
 
-def get_password_hash(password):
-    return pwd_context.hash(password)
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    pw_bytes = plain_password.encode("utf-8")[:72]
+    return bcrypt.checkpw(pw_bytes, hashed_password.encode("utf-8"))
 
 def create_access_token(data: dict, expires_delta: timedelta | None = None):
     to_encode = data.copy()
