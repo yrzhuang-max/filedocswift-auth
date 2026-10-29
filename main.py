@@ -4,7 +4,6 @@ from pydantic import BaseModel, EmailStr
 from sqlalchemy import create_engine, Column, Integer, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
-import requests
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
@@ -138,7 +137,7 @@ def login(req: LoginSchema, db: Session = Depends(get_db)):
         key="access_token",
         value=token,
         httponly=True,
-        secure=True,          # Render HTTPS打开；本地调试改成 secure=False
+        secure=False,          # Render HTTPS打开；本地调试改成 secure=False
         samesite="lax",
         max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         path="/"
