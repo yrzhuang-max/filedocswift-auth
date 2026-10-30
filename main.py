@@ -54,6 +54,19 @@ EMAIL_FROM = os.getenv("EMAIL_FROM")
 
 app = FastAPI()
 
+@app.middleware("http")
+async def strip_query_params(request: Request, call_next):
+    path = request.url.path
+    # API路由跳过，不清除参数
+    if path.startswith("/api/"):
+        return await call_next(request)
+
+    url = str(request.url)
+    if "?" in url:
+        clean_url = url.split("?")[0]
+        return Response(status_code=301, headers={"Location": clean_url})
+    return await call_next(request)
+
 # CORS 配置，允许你的前端域名
 origins = [
     "http://localhost:3000",
