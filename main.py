@@ -10,6 +10,33 @@ import bcrypt
 from datetime import datetime, timedelta
 import os
 import uuid
+from typing import Dict
+
+# ===================== 内存限流 开始 =====================
+login_limiter: Dict[str, list[float]] = {}   # key: IP
+reset_limiter: Dict[str, list[float]] = {}   # key: email
+
+def clean_old_records(records: list[float], window_sec: float) -> list[float]:
+    now = datetime.utcnow().timestamp()
+    return [ts for ts in records if now - ts < window_sec]
+
+def check_rate_limit(store: Dict[str, list[float]], key: str, max_count: int, window_sec: float) -> bool:
+    now_ts = datetime.utcnow().timestamp()
+    records = clean_old_records(store.get(key, []), window_sec)
+    if len(records) >= max_count:
+        return False
+    records.append(now_ts)
+    store[key] = records
+    return True
+
+# 登录：同一IP 5次 / 10分钟(600s)
+def check_login_limit(ip: str) -> bool:
+    return check_rate_limit(login_limiter, ip, 5, 600)
+
+# 重置密码邮件：同一邮箱 3次 / 1小时(3600s)
+def check_reset_email_limit(email: str) -> bool:
+    return check_rate_limit(reset_limiter, email, 3, 3600)
+# ===================== 内存限流 结束 =====================
 
 # ===================== 配置 =====================
 SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL")
@@ -85,7 +112,7 @@ class ResetConfirmReq(BaseModel):
     token: str
     password: str
 
-# ===================== 工具函数（原生bcrypt，移除passlib） =====================
+# ===================== 工具函数（原生bcrypt） =====================
 def get_password_hash(password: str) -> str:
     # bcrypt 限制最多72字节，自动截断
     pw_bytes = password.encode("utf-8")[:72]
@@ -171,7 +198,11 @@ async def register(req: RegisterReq, db: Session = Depends(get_db)):
     return {"msg": "Register success, please login"}
 
 @app.post("/api/auth/login")
-async def login(req: LoginReq, res: Response, db: Session = Depends(get_db)):
+async def login(request: Request, req: LoginReq, res: Response, db: Session = Depends(get_db)):
+    client_ip = request.client.host
+    if not check_login_limit(client_ip):
+        raise HTTPException(status_code=429, detail="Too many login attempts, please try again later")
+
     await verify_hcaptcha(req.hcaptchaToken)
     user = db.query(DBUser).filter(DBUser.email == req.email).first()
     if not user or not verify_password(req.password, user.hashed_password):
@@ -204,7 +235,10 @@ async def me(request: Request, db: Session = Depends(get_db)):
     return {"user": {"id": user.id, "email": user.email}}
 
 @app.post("/api/auth/reset-password-request")
-async def reset_request(req: ResetRequestReq, db: Session = Depends(get_db)):
+async def reset_request(request: Request, req: ResetRequestReq, db: Session = Depends(get_db)):
+    if not check_reset_email_limit(req.email):
+        raise HTTPException(status_code=429, detail="Too many reset requests for this email, try again later")
+
     await verify_hcaptcha(req.hcaptchaToken)
     user = db.query(DBUser).filter(DBUser.email == req.email).first()
     # 不管有没有这个邮箱，返回同样提示，防止邮箱探测
