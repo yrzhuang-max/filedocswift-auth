@@ -7,3 +7,6 @@ pydantic-settings
 email-validator
 psycopg[binary]
 sqlalchemy
+slowapi
+limits
+redis
