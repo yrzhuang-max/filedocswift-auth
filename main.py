@@ -211,7 +211,7 @@ async def register(req: RegisterReq, db: Session = Depends(get_db)):
     return {"msg": "Register success, please login"}
 
 @app.post("/api/auth/login")
-async def login(request: Request, req: LoginReq, res: Response, db: Session = Depends(get_db)):
+async def login(request: Request, req: LoginReq, db: Session = Depends(get_db)):
     client_ip = request.client.host
     if not check_login_limit(client_ip):
         raise HTTPException(status_code=429, detail="Too many login attempts, please try again later")
@@ -224,26 +224,18 @@ async def login(request: Request, req: LoginReq, res: Response, db: Session = De
         data={"sub": user.email},
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     )
-    res.set_cookie(
-        key="access_token",
-        value=access_token,
-        httponly=True,
-        secure=True,
-        samesite="none",
-        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-    )
-    return {"msg": "Login success"}
+    return {"msg": "Login success", "token": access_token}
 
 @app.post("/api/auth/logout")
-async def logout(res: Response):
-    res.delete_cookie(key="access_token")
+async def logout():
     return {"msg": "Logged out"}
 
 @app.get("/api/auth/me")
 async def me(request: Request, db: Session = Depends(get_db)):
-    token = request.cookies.get("access_token")
-    if not token:
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Not login")
+    token = auth_header.removeprefix("Bearer ")
     user = get_current_user(db, token)
     return {
         "user": {
