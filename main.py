@@ -1,9 +1,10 @@
 from fastapi import FastAPI, Depends, HTTPException, status, Request, Response, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
+from contextlib import asynccontextmanager
 import httpx
 from jose import JWTError, jwt
 import bcrypt
@@ -56,7 +57,25 @@ HCAPTCHA_SECRET = os.getenv("HCAPTCHA_SECRET")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 EMAIL_FROM = os.getenv("EMAIL_FROM")
 
-app = FastAPI()
+# ========== lifespan 迁移脚本 ==========
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 启动阶段：执行字段迁移
+    db = next(get_db())
+    try:
+        sql = "ALTER TABLE users ADD COLUMN IF NOT EXISTS credit_balance INTEGER NOT NULL DEFAULT 0;"
+        db.execute(text(sql))
+        db.commit()
+        logging.info("✅ 迁移执行成功：credit_balance 字段")
+    except Exception as e:
+        logging.warning(f"⚠️ 迁移执行：{str(e)}")
+        db.rollback()
+    finally:
+        db.close()
+    yield
+    # 关闭服务时这里不用写逻辑
+
+app = FastAPI(lifespan=lifespan)
 
 @app.middleware("http")
 async def strip_query_params(request: Request, call_next):
@@ -91,7 +110,7 @@ class DBUser(Base):
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
-    # 注意：credit_balance / subscription_plan 等字段目前不在表内，如需持久化，要新增字段并迁移数据库
+    credit_balance = Column(Integer, default=0, nullable=False)
 
 class PasswordResetToken(Base):
     __tablename__ = "password_reset_tokens"
@@ -172,10 +191,10 @@ async def send_reset_email(to_email: str, reset_token: str):
         "to": [to_email],
         "subject": "FiledocSwift Password Reset",
         "html": f"""
-        <p>Click the link below to reset your password. Link valid for 1 hour, one-time use.</p>
-        <a href="{reset_link}">{reset_link}</a>
-        <p>If you didn't request this, ignore this email.</p>
-        """
+    <p>Click the link below to reset your password. Link valid for 1 hour, one-time use.</p>
+    <a href="{reset_link}">{reset_link}</a>
+    <p>If you didn't request this, ignore this email.</p>
+    """
     }
     async with httpx.AsyncClient() as client:
         await client.post(
@@ -251,7 +270,7 @@ async def me(authorization: str | None = Header(default=None), db: Session = Dep
         "user": {
             "id": user.id,
             "email": user.email,
-            "credit_balance": 0,
+            "credit_balance": user.credit_balance,
             "subscription_plan": "free",
             "subscription_status": "active",
             "background": "#ffffff",
