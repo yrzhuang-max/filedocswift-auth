@@ -245,7 +245,17 @@ async def me(request: Request, db: Session = Depends(get_db)):
     if not token:
         raise HTTPException(status_code=401, detail="Not login")
     user = get_current_user(db, token)
-    return {"user": {"id": user.id, "email": user.email}}
+    return {
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "credit_balance": user.credit_balance,
+            "subscription_plan": user.subscription_plan,
+            "subscription_status": user.subscription_status,
+            "background": user.background,
+            "foreground": user.foreground
+        }
+    }
 
 @app.post("/api/auth/reset-password-request")
 async def reset_request(request: Request, req: ResetRequestReq, db: Session = Depends(get_db)):
