@@ -291,3 +291,61 @@ async def reset_confirm(req: ResetConfirmReq, db: Session = Depends(get_db)):
     rt.used = True
     db.commit()
     return {"msg": "Password updated successfully, please login"}
+
+from sqlalchemy import text
+
+@app.get("/migrate-db-once")
+def migrate_db():
+    with engine.connect() as conn:
+        sql = """
+ALTER TABLE users
+ADD COLUMN IF NOT EXISTS bonus_credit_granted BOOLEAN DEFAULT false,
+ADD COLUMN IF NOT EXISTS credit_balance INTEGER DEFAULT 0,
+ADD COLUMN IF NOT EXISTS subscription_plan TEXT,
+ADD COLUMN IF NOT EXISTS subscription_status TEXT,
+ADD COLUMN IF NOT EXISTS background TEXT,
+ADD COLUMN IF NOT EXISTS foreground TEXT,
+ADD COLUMN IF NOT EXISTS font_sans TEXT,
+ADD COLUMN IF NOT EXISTS theme_inline TEXT,
+ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
+
+CREATE TABLE IF NOT EXISTS credit_transactions (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    amount INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    remark TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS payments (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    order_id TEXT UNIQUE NOT NULL,
+    plan TEXT NOT NULL,
+    amount DECIMAL(10,2) NOT NULL,
+    status TEXT NOT NULL,
+    pay_time TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS conversion_jobs (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    file_name TEXT NOT NULL,
+    file_size BIGINT,
+    status TEXT NOT NULL,
+    result_url TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    finished_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE INDEX IF NOT EXISTS idx_credit_transactions_user_id ON credit_transactions(user_id);
+CREATE INDEX IF NOT EXISTS idx_payments_user_id ON payments(user_id);
+CREATE INDEX IF NOT EXISTS idx_conversion_jobs_user_id ON conversion_jobs(user_id);
+"""
+        conn.execute(text(sql))
+        conn.commit()
+    return {"msg":"迁移执行完成"}
