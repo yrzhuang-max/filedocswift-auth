@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status, Request, Response
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Response, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean
@@ -7,21 +7,25 @@ from sqlalchemy.orm import sessionmaker, Session
 import httpx
 from jose import JWTError, jwt
 import bcrypt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 import os
 import uuid
 from typing import Dict
+import logging
+
+# 开启日志
+logging.basicConfig(level=logging.INFO)
 
 # ===================== 内存限流 开始 =====================
-login_limiter: Dict[str, list[float]] = {}   # key: IP
+login_limiter: Dict[str, list[float]] = {}  # key: IP
 reset_limiter: Dict[str, list[float]] = {}   # key: email
 
 def clean_old_records(records: list[float], window_sec: float) -> list[float]:
-    now = datetime.utcnow().timestamp()
+    now = datetime.now(UTC).timestamp()
     return [ts for ts in records if now - ts < window_sec]
 
 def check_rate_limit(store: Dict[str, list[float]], key: str, max_count: int, window_sec: float) -> bool:
-    now_ts = datetime.utcnow().timestamp()
+    now_ts = datetime.now(UTC).timestamp()
     records = clean_old_records(store.get(key, []), window_sec)
     if len(records) >= max_count:
         return False
@@ -87,6 +91,7 @@ class DBUser(Base):
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
+    # 注意：credit_balance / subscription_plan 等字段目前不在表内，如需持久化，要新增字段并迁移数据库
 
 class PasswordResetToken(Base):
     __tablename__ = "password_reset_tokens"
@@ -139,9 +144,9 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 def create_access_token(data: dict, expires_delta: timedelta | None = None):
     to_encode = data.copy()
     if expires_delta:
-        expire = datetime.utcnow() + expires_delta
+        expire = datetime.now(UTC) + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
+        expire = datetime.now(UTC) + timedelta(minutes=15)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
@@ -185,15 +190,21 @@ def get_current_user(db: Session, token: str):
         detail="Could not validate credentials",
     )
     try:
+        logging.info(f"[JWT] 开始解码 token: {token[:40]}...")
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        logging.info(f"[JWT] 解码成功, payload = {payload}")
         email: str = payload.get("sub")
         if email is None:
+            logging.info("[JWT] sub字段为空")
             raise credentials_exception
-    except JWTError:
+    except JWTError as e:
+        logging.info(f"[JWT] 解码失败, error = {str(e)}")
         raise credentials_exception
     user = db.query(DBUser).filter(DBUser.email == email).first()
     if user is None:
+        logging.info(f"[JWT] 数据库找不到该用户: {email}")
         raise credentials_exception
+    logging.info(f"[JWT] 校验通过，用户 {email}")
     return user
 
 # ===================== 接口 =====================
@@ -231,21 +242,20 @@ async def logout():
     return {"msg": "Logged out"}
 
 @app.get("/api/auth/me")
-async def me(request: Request, db: Session = Depends(get_db)):
-    auth_header = request.headers.get("Authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
+async def me(authorization: str | None = Header(default=None), db: Session = Depends(get_db)):
+    if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Not login")
-    token = auth_header.removeprefix("Bearer ")
+    token = authorization.removeprefix("Bearer ")
     user = get_current_user(db, token)
     return {
         "user": {
             "id": user.id,
             "email": user.email,
-            "credit_balance": user.credit_balance,
-            "subscription_plan": user.subscription_plan,
-            "subscription_status": user.subscription_status,
-            "background": user.background,
-            "foreground": user.foreground
+            "credit_balance": 0,
+            "subscription_plan": "free",
+            "subscription_status": "active",
+            "background": "#ffffff",
+            "foreground": "#171717"
         }
     }
 
@@ -262,7 +272,7 @@ async def reset_request(request: Request, req: ResetRequestReq, db: Session = De
 
     # 生成一次性token，1小时过期
     token_str = str(uuid.uuid4())
-    expire = datetime.utcnow() + timedelta(hours=1)
+    expire = datetime.now(UTC) + timedelta(hours=1)
     reset_token = PasswordResetToken(
         email=req.email,
         token=token_str,
@@ -279,7 +289,7 @@ async def reset_confirm(req: ResetConfirmReq, db: Session = Depends(get_db)):
     rt = db.query(PasswordResetToken).filter(
         PasswordResetToken.token == req.token,
         PasswordResetToken.used == False,
-        PasswordResetToken.expires_at > datetime.utcnow()
+        PasswordResetToken.expires_at > datetime.now(UTC)
     ).first()
     if not rt:
         raise HTTPException(status_code=400, detail="Invalid or expired token")
