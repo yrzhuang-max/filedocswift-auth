@@ -13,6 +13,8 @@ import os
 import uuid
 from typing import Dict
 import logging
+import asyncio
+import time
 
 # 开启日志
 logging.basicConfig(level=logging.INFO)
@@ -57,7 +59,20 @@ HCAPTCHA_SECRET = os.getenv("HCAPTCHA_SECRET")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 EMAIL_FROM = os.getenv("EMAIL_FROM")
 
-app = FastAPI()
+# 全局httpx客户端，增加连接池限制，防止连接池堆积污染
+http_client: httpx.AsyncClient | None = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global http_client
+    http_client = httpx.AsyncClient(
+        timeout=2.5,
+        limits=httpx.Limits(max_connections=20, max_keepalive_connections=5)
+    )
+    yield
+    await http_client.aclose()
+
+app = FastAPI(lifespan=lifespan)
 
 @app.middleware("http")
 async def strip_query_params(request: Request, call_next):
@@ -142,6 +157,10 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     pw_bytes = plain_password.encode("utf-8")[:72]
     return bcrypt.checkpw(pw_bytes, hashed_password.encode("utf-8"))
 
+# 异步版本，给async登录接口使用，不阻塞事件循环
+async def verify_password_async(plain_password: str, hashed_password: str) -> bool:
+    return await asyncio.to_thread(verify_password, plain_password, hashed_password)
+
 def create_access_token(data: dict, expires_delta: timedelta | None = None):
     to_encode = data.copy()
     if expires_delta:
@@ -155,12 +174,11 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None):
 async def verify_hcaptcha(token: str):
     if not HCAPTCHA_SECRET:
         raise HTTPException(status_code=500, detail="HCAPTCHA_SECRET not configured")
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            "https://api.hcaptcha.com/siteverify",
-            data={"secret": HCAPTCHA_SECRET, "response": token}
-        )
-        data = resp.json()
+    resp = await http_client.post(
+        "https://api.hcaptcha.com/siteverify",
+        data={"secret": HCAPTCHA_SECRET, "response": token}
+    )
+    data = resp.json()
     if not data.get("success"):
         raise HTTPException(status_code=400, detail="hCaptcha validation failed")
 
@@ -178,12 +196,11 @@ async def send_reset_email(to_email: str, reset_token: str):
     <p>If you didn't request this, ignore this email.</p>
     """
     }
-    async with httpx.AsyncClient() as client:
-        await client.post(
-            "https://api.resend.com/emails",
-            json=payload,
-            headers={"Authorization": f"Bearer {RESEND_API_KEY}"}
-        )
+    await http_client.post(
+        "https://api.resend.com/emails",
+        json=payload,
+        headers={"Authorization": f"Bearer {RESEND_API_KEY}"}
+    )
 
 def get_current_user(db: Session, token: str):
     credentials_exception = HTTPException(
@@ -216,26 +233,41 @@ async def register(req: RegisterReq, db: Session = Depends(get_db)):
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
     hashed = get_password_hash(req.password)
-# 新注册用户赠送3点数
+    # 新注册用户赠送3点数
     user = DBUser(email=req.email, hashed_password=hashed, credit_balance=3)
     db.add(user)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     db.refresh(user)
     return {"msg": "Register success, please login"}
 
 @app.post("/api/auth/login")
 async def login(request: Request, req: LoginReq, db: Session = Depends(get_db)):
+    t0 = time.perf_counter()
     client_ip = request.client.host
     if not check_login_limit(client_ip):
         raise HTTPException(status_code=429, detail="Too many login attempts, please try again later")
+    t1 = time.perf_counter()
 
     await verify_hcaptcha(req.hcaptchaToken)
+    t2 = time.perf_counter()
+
     user = db.query(DBUser).filter(DBUser.email == req.email).first()
-    if not user or not verify_password(req.password, user.hashed_password):
+    if not user or not await verify_password_async(req.password, user.hashed_password):
         raise HTTPException(status_code=400, detail="Invalid email or password")
+    t3 = time.perf_counter()
+
     access_token = create_access_token(
         data={"sub": user.email},
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+    t4 = time.perf_counter()
+
+    logging.info(
+        f"LOGIN_TIMING | limit:{t1-t0:.3f}s | hcaptcha:{t2-t1:.3f}s | db+bcrypt:{t3-t2:.3f}s | jwt:{t4-t3:.3f}s | total:{t4-t0:.3f}s"
     )
     return {"msg": "Login success", "token": access_token}
 
@@ -282,7 +314,11 @@ async def reset_request(request: Request, req: ResetRequestReq, db: Session = De
         used=False
     )
     db.add(reset_token)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     await send_reset_email(req.email, token_str)
     return {"msg": "If this email exists in our system, a password reset link has been sent."}
 
@@ -303,5 +339,9 @@ async def reset_confirm(req: ResetConfirmReq, db: Session = Depends(get_db)):
     # 更新密码
     user.hashed_password = get_password_hash(req.password)
     rt.used = True
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     return {"msg": "Password updated successfully, please login"}
