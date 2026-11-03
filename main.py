@@ -57,25 +57,7 @@ HCAPTCHA_SECRET = os.getenv("HCAPTCHA_SECRET")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 EMAIL_FROM = os.getenv("EMAIL_FROM")
 
-# ========== lifespan 迁移脚本 ==========
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # 启动阶段：执行字段迁移
-    db = next(get_db())
-    try:
-        sql = "ALTER TABLE users ADD COLUMN IF NOT EXISTS credit_balance INTEGER NOT NULL DEFAULT 0;"
-        db.execute(text(sql))
-        db.commit()
-        logging.info("✅ 迁移执行成功：credit_balance 字段")
-    except Exception as e:
-        logging.warning(f"⚠️ 迁移执行：{str(e)}")
-        db.rollback()
-    finally:
-        db.close()
-    yield
-    # 关闭服务时这里不用写逻辑
-
-app = FastAPI(lifespan=lifespan)
+app = FastAPI()
 
 @app.middleware("http")
 async def strip_query_params(request: Request, call_next):
@@ -234,7 +216,8 @@ async def register(req: RegisterReq, db: Session = Depends(get_db)):
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
     hashed = get_password_hash(req.password)
-    user = DBUser(email=req.email, hashed_password=hashed)
+# 新注册用户赠送3点数
+    user = DBUser(email=req.email, hashed_password=hashed, credit_balance=3)
     db.add(user)
     db.commit()
     db.refresh(user)
