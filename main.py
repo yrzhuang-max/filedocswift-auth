@@ -15,6 +15,7 @@ from typing import Dict
 import logging
 import asyncio
 import time
+import re
 
 # 开启日志
 logging.basicConfig(level=logging.INFO)
@@ -44,6 +45,17 @@ def check_login_limit(ip: str) -> bool:
 def check_reset_email_limit(email: str) -> bool:
     return check_rate_limit(reset_limiter, email, 3, 3600)
 # ===================== 内存限流 结束 =====================
+
+# ===================== 密码校验工具 =====================
+def validate_password(password: str) -> bool:
+    if len(password) < 8:
+        return False
+    if not re.search(r"[a-zA-Z]", password):
+        return False
+    if not re.search(r"[0-9]", password):
+        return False
+    return True
+# ========================================================
 
 # ===================== 配置 =====================
 SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL")
@@ -228,10 +240,16 @@ def get_current_user(db: Session, token: str):
 # ===================== 接口 =====================
 @app.post("/api/auth/register")
 async def register(req: RegisterReq, db: Session = Depends(get_db)):
+    # 后端密码校验
+    if not validate_password(req.password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password must be at least 8 characters and contain both letters and numbers."
+        )
     await verify_hcaptcha(req.hcaptchaToken)
     existing = db.query(DBUser).filter(DBUser.email == req.email).first()
     if existing:
-        raise HTTPException(status_code=400, detail="Email already registered")
+        raise HTTPException(status_code=409, detail="Email already registered")
     hashed = get_password_hash(req.password)
     # 新注册用户赠送3点数
     user = DBUser(email=req.email, hashed_password=hashed, credit_balance=3)
@@ -324,6 +342,13 @@ async def reset_request(request: Request, req: ResetRequestReq, db: Session = De
 
 @app.post("/api/auth/reset-password-confirm")
 async def reset_confirm(req: ResetConfirmReq, db: Session = Depends(get_db)):
+    # 后端密码校验
+    if not validate_password(req.password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password must be at least 8 characters and contain both letters and numbers."
+        )
+
     rt = db.query(PasswordResetToken).filter(
         PasswordResetToken.token == req.token,
         PasswordResetToken.used == False,
