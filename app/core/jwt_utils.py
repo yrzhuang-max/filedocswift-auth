@@ -21,9 +21,9 @@ def b64url_decode(s: str) -> bytes:
 
 
 def get_jwt_secret() -> str:
-    value = os.getenv("SECRET_KEY")
+    value = os.getenv("JWT_SECRET_KEY")
     if not value:
-        raise RuntimeError("SECRET_KEY is not configured in .env")
+        raise RuntimeError("JWT_SECRET_KEY is not configured in .env")
     return value
 
 
