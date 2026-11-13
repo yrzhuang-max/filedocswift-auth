@@ -2,7 +2,7 @@ fastapi
 uvicorn
 httpx
 bcrypt
-python-jose[cryptography]
+joserfc
 pydantic-settings
 email-validator
 psycopg[binary]
