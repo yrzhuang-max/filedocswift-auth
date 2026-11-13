@@ -92,7 +92,6 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-
 app = FastAPI(lifespan=lifespan)
 
 origins = [
@@ -128,6 +127,7 @@ from app.paddle.checkout import router as paddle_checkout_router
 app.include_router(user_router, prefix="/api")
 app.include_router(paddle_webhook_router, prefix="/api/paddle")
 app.include_router(paddle_checkout_router, prefix="/api/paddle")
+app.include_router(auth_router, prefix="/api/auth")
 
 # ===================== Pydantic Schema =====================
 class RegisterReq(BaseModel):
