@@ -1,12 +1,13 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI, Depends, HTTPException, status, Request, Response, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, text
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.orm import Session
+from sqlalchemy import func
 from contextlib import asynccontextmanager
 import httpx
-from jose import JWTError, jwt
 import bcrypt
 from datetime import datetime, timedelta, UTC
 import os
@@ -16,17 +17,34 @@ import logging
 import asyncio
 import time
 import re
+import stripe
+from app.core.security import get_current_user, dep_current_user
+from app.core.config import ACCESS_TOKEN_EXPIRE_DELTA,SECRET_KEY, ALGORITHM
+from app.core.jwt_utils import create_access_token, decode_access_token
 
-# 开启日志
+from app.database import engine, Base, get_db
+from app.models import (
+    DBUser,
+    PasswordResetToken,
+    RechargeOrder,
+    CreditTransaction,
+    PaddleWebhookRecord,
+    PaddlePricePlan
+)
+
+Base.metadata.create_all(bind=engine)
+
 logging.basicConfig(level=logging.INFO)
 
-# ===================== 内存限流 开始 =====================
-login_limiter: Dict[str, list[float]] = {}  # key: IP
-reset_limiter: Dict[str, list[float]] = {}   # key: email
+# ===================== 内存限流 =====================
+login_limiter: Dict[str, list[float]] = {}
+reset_limiter: Dict[str, list[float]] = {}
+
 
 def clean_old_records(records: list[float], window_sec: float) -> list[float]:
     now = datetime.now(UTC).timestamp()
     return [ts for ts in records if now - ts < window_sec]
+
 
 def check_rate_limit(store: Dict[str, list[float]], key: str, max_count: int, window_sec: float) -> bool:
     now_ts = datetime.now(UTC).timestamp()
@@ -37,16 +55,15 @@ def check_rate_limit(store: Dict[str, list[float]], key: str, max_count: int, wi
     store[key] = records
     return True
 
-# 登录：同一IP 5次 / 10分钟(600s)
+
 def check_login_limit(ip: str) -> bool:
     return check_rate_limit(login_limiter, ip, 5, 600)
 
-# 重置密码邮件：同一邮箱 3次 / 1小时(3600s)
+
 def check_reset_email_limit(email: str) -> bool:
     return check_rate_limit(reset_limiter, email, 3, 3600)
-# ===================== 内存限流 结束 =====================
 
-# ===================== 密码校验工具 =====================
+# ===================== 密码校验 =====================
 def validate_password(password: str) -> bool:
     if len(password) < 8:
         return False
@@ -55,24 +72,16 @@ def validate_password(password: str) -> bool:
     if not re.search(r"[0-9]", password):
         return False
     return True
-# ========================================================
 
 # ===================== 配置 =====================
-SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL")
-engine = create_engine(SQLALCHEMY_DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-SECRET_KEY = os.getenv("JWT_SECRET_KEY")
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24h
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 
 HCAPTCHA_SECRET = os.getenv("HCAPTCHA_SECRET")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 EMAIL_FROM = os.getenv("EMAIL_FROM")
 
-# 全局httpx客户端，增加连接池限制，防止连接池堆积污染
 http_client: httpx.AsyncClient | None = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -84,26 +93,13 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
+
 app = FastAPI(lifespan=lifespan)
 
-@app.middleware("http")
-async def strip_query_params(request: Request, call_next):
-    path = request.url.path
-    # API路由跳过，不清除参数
-    if path.startswith("/api/"):
-        return await call_next(request)
-
-    url = str(request.url)
-    if "?" in url:
-        clean_url = url.split("?")[0]
-        return Response(status_code=301, headers={"Location": clean_url})
-    return await call_next(request)
-
-# CORS 配置，允许你的前端域名
 origins = [
-    "http://localhost:3000",
     "https://filedocswift.com",
-    "https://www.filedocswift.com"
+    "https://www.filedocswift.com",
+    "https://filedocswift.vercel.app"
 ]
 app.add_middleware(
     CORSMiddleware,
@@ -113,31 +109,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ===================== 数据库模型 =====================
-class DBUser(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    email = Column(String, unique=True, index=True, nullable=False)
-    hashed_password = Column(String, nullable=False)
-    credit_balance = Column(Integer, default=0, nullable=False)
+@app.middleware("http")
+async def strip_query_params(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/api/"):
+        return await call_next(request)
+    url = str(request.url)
+    if "?" in url:
+        clean_url = url.split("?")[0]
+        return Response(status_code=301, headers={"Location": clean_url})
+    return await call_next(request)
 
-class PasswordResetToken(Base):
-    __tablename__ = "password_reset_tokens"
-    id = Column(Integer, primary_key=True, index=True)
-    email = Column(String, nullable=False)
-    token = Column(String, unique=True, index=True, nullable=False)
-    expires_at = Column(DateTime, nullable=False)
-    used = Column(Boolean, default=False)
 
-Base.metadata.create_all(bind=engine)
+# ========== 路由导入 & 注册（放在 app 实例之后） ==========
+from app.api.user import router as user_router
+from app.paddle.webhook import router as paddle_webhook_router
+from app.paddle.checkout import router as paddle_checkout_router
 
-# ===================== DB依赖 =====================
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+app.include_router(user_router, prefix="/api")
+app.include_router(paddle_webhook_router, prefix="/api/paddle")
+app.include_router(paddle_checkout_router, prefix="/api/paddle")
 
 # ===================== Pydantic Schema =====================
 class RegisterReq(BaseModel):
@@ -145,54 +136,57 @@ class RegisterReq(BaseModel):
     password: str
     hcaptchaToken: str
 
+
 class LoginReq(BaseModel):
     email: EmailStr
     password: str
     hcaptchaToken: str
 
+
 class ResetRequestReq(BaseModel):
     email: EmailStr
     hcaptchaToken: str
+
 
 class ResetConfirmReq(BaseModel):
     token: str
     password: str
 
-# ===================== 工具函数（原生bcrypt） =====================
+# ===================== 密码工具 =====================
 def get_password_hash(password: str) -> str:
-    # bcrypt 限制最多72字节，自动截断
     pw_bytes = password.encode("utf-8")[:72]
     salt = bcrypt.gensalt()
     return bcrypt.hashpw(pw_bytes, salt).decode("utf-8")
+
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     pw_bytes = plain_password.encode("utf-8")[:72]
     return bcrypt.checkpw(pw_bytes, hashed_password.encode("utf-8"))
 
-# 异步版本，给async登录接口使用，不阻塞事件循环
+
 async def verify_password_async(plain_password: str, hashed_password: str) -> bool:
     return await asyncio.to_thread(verify_password, plain_password, hashed_password)
 
-def create_access_token(data: dict, expires_delta: timedelta | None = None):
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.now(UTC) + expires_delta
-    else:
-        expire = datetime.now(UTC) + timedelta(minutes=15)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
 
 async def verify_hcaptcha(token: str):
+    # dev bypass 优先
+    if token == "dummy":
+        return True
+
+    skip = os.getenv("SKIP_HCAPTCHA", "false").lower() == "true"
+    if skip:
+        return True
+
     if not HCAPTCHA_SECRET:
         raise HTTPException(status_code=500, detail="HCAPTCHA_SECRET not configured")
+
     resp = await http_client.post(
         "https://api.hcaptcha.com/siteverify",
         data={"secret": HCAPTCHA_SECRET, "response": token}
     )
     data = resp.json()
-    if not data.get("success"):
-        raise HTTPException(status_code=400, detail="hCaptcha validation failed")
+    return data.get("success", False)
+
 
 async def send_reset_email(to_email: str, reset_token: str):
     if not RESEND_API_KEY or not EMAIL_FROM:
@@ -214,33 +208,10 @@ async def send_reset_email(to_email: str, reset_token: str):
         headers={"Authorization": f"Bearer {RESEND_API_KEY}"}
     )
 
-def get_current_user(db: Session, token: str):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-    )
-    try:
-        logging.info(f"[JWT] 开始解码 token: {token[:40]}...")
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        logging.info(f"[JWT] 解码成功, payload = {payload}")
-        email: str = payload.get("sub")
-        if email is None:
-            logging.info("[JWT] sub字段为空")
-            raise credentials_exception
-    except JWTError as e:
-        logging.info(f"[JWT] 解码失败, error = {str(e)}")
-        raise credentials_exception
-    user = db.query(DBUser).filter(DBUser.email == email).first()
-    if user is None:
-        logging.info(f"[JWT] 数据库找不到该用户: {email}")
-        raise credentials_exception
-    logging.info(f"[JWT] 校验通过，用户 {email}")
-    return user
 
 # ===================== 接口 =====================
 @app.post("/api/auth/register")
 async def register(req: RegisterReq, db: Session = Depends(get_db)):
-    # 后端密码校验
     if not validate_password(req.password):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -251,7 +222,6 @@ async def register(req: RegisterReq, db: Session = Depends(get_db)):
     if existing:
         raise HTTPException(status_code=409, detail="Email already registered")
     hashed = get_password_hash(req.password)
-    # 新注册用户赠送3点数
     user = DBUser(email=req.email, hashed_password=hashed, credit_balance=3)
     db.add(user)
     try:
@@ -261,6 +231,7 @@ async def register(req: RegisterReq, db: Session = Depends(get_db)):
         raise
     db.refresh(user)
     return {"msg": "Register success, please login"}
+
 
 @app.post("/api/auth/login")
 async def login(request: Request, req: LoginReq, db: Session = Depends(get_db)):
@@ -273,15 +244,39 @@ async def login(request: Request, req: LoginReq, db: Session = Depends(get_db)):
     await verify_hcaptcha(req.hcaptchaToken)
     t2 = time.perf_counter()
 
-    user = db.query(DBUser).filter(DBUser.email == req.email).first()
+    user = (
+        db.query(DBUser)
+        .filter(func.lower(DBUser.email) == func.lower(req.email))
+        .first()
+    )
+    print("-" * 60)
+    print(f"input email: {repr(req.email)}")
+    print(f"input password raw: {repr(req.password)}")
+    if user:
+        print(f"found user in db, email: {repr(user.email)}")
+        print(f"stored hashed_password: {repr(user.hashed_password)}")
+        ok = bcrypt.checkpw(req.password.encode("utf-8"), user.hashed_password.encode("utf-8"))
+        print(f"bcrypt direct check result: {ok}")
+    else:
+        print("user NOT found from database")
+    print("-" * 60)
+
     if not user or not await verify_password_async(req.password, user.hashed_password):
-        raise HTTPException(status_code=400, detail="Invalid email or password")
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
     t3 = time.perf_counter()
 
+    print("=== LOGIN CREATE TOKEN SECRET ===", repr(os.getenv("SECRET_KEY")))
     access_token = create_access_token(
         data={"sub": user.email},
-        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        expires_delta=timedelta(minutes=int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30")))
     )
+    # 修复变量名
+    try:
+        check = decode_access_token(access_token)
+        print(f"✅ SELF CHECK PASS: {check}")
+    except Exception as e:
+        print(f"❌ SELF CHECK FAIL: {e}")
     t4 = time.perf_counter()
 
     logging.info(
@@ -293,23 +288,21 @@ async def login(request: Request, req: LoginReq, db: Session = Depends(get_db)):
 async def logout():
     return {"msg": "Logged out"}
 
+
 @app.get("/api/auth/me")
-async def me(authorization: str | None = Header(default=None), db: Session = Depends(get_db)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Not login")
-    token = authorization.removeprefix("Bearer ")
-    user = get_current_user(db, token)
+async def me(current_user: DBUser = Depends(dep_current_user)):
     return {
         "user": {
-            "id": user.id,
-            "email": user.email,
-            "credit_balance": user.credit_balance,
+            "id": current_user.id,
+            "email": current_user.email,
+            "credit_balance": current_user.credit_balance,
             "subscription_plan": "free",
             "subscription_status": "active",
             "background": "#ffffff",
             "foreground": "#171717"
         }
     }
+
 
 @app.post("/api/auth/reset-password-request")
 async def reset_request(request: Request, req: ResetRequestReq, db: Session = Depends(get_db)):
@@ -318,11 +311,9 @@ async def reset_request(request: Request, req: ResetRequestReq, db: Session = De
 
     await verify_hcaptcha(req.hcaptchaToken)
     user = db.query(DBUser).filter(DBUser.email == req.email).first()
-    # 不管有没有这个邮箱，返回同样提示，防止邮箱探测
     if not user:
         return {"msg": "If this email exists in our system, a password reset link has been sent."}
 
-    # 生成一次性token，1小时过期
     token_str = str(uuid.uuid4())
     expire = datetime.now(UTC) + timedelta(hours=1)
     reset_token = PasswordResetToken(
@@ -340,9 +331,9 @@ async def reset_request(request: Request, req: ResetRequestReq, db: Session = De
     await send_reset_email(req.email, token_str)
     return {"msg": "If this email exists in our system, a password reset link has been sent."}
 
+
 @app.post("/api/auth/reset-password-confirm")
 async def reset_confirm(req: ResetConfirmReq, db: Session = Depends(get_db)):
-    # 后端密码校验
     if not validate_password(req.password):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -361,7 +352,6 @@ async def reset_confirm(req: ResetConfirmReq, db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=400, detail="User not found")
 
-    # 更新密码
     user.hashed_password = get_password_hash(req.password)
     rt.used = True
     try:
