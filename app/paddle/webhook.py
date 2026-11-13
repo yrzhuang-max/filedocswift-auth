@@ -130,6 +130,20 @@ async def paddle_webhook(
 
     remark = f"Paddle webhook: {event_name}"
 
+# ---- 新增：在这里提取 price_id ----
+    price_id = None
+    if event_name == "transaction.completed":
+        details = data.get("details", {})
+        line_items = details.get("line_items", [])
+        if line_items:
+            first_item = line_items[0]
+            price_id = first_item.get("price", {}).get("id")
+    elif event_name in ("subscription.activated", "subscription.renewed"):
+        items = data.get("items", [])
+        if items:
+            first_item = items[0]
+            price_id = first_item.get("price", {}).get("id")
+# -----------------------------------
     if event_name in ("transaction.completed", "subscription.activated", "subscription.renewed"):
         print(f"INFO: {event_name} | user_id={user_id}, tx={transaction_id}, price_id={price_id}")
         if user_id is not None:
