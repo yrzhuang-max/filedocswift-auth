@@ -121,6 +121,7 @@ async def strip_query_params(request: Request, call_next):
 
 # ========== 路由导入 & 注册（放在 app 实例之后） ==========
 from app.api.user import router as user_router
+from app.api.auth import router as auth_router
 from app.paddle.webhook import router as paddle_webhook_router
 from app.paddle.checkout import router as paddle_checkout_router
 
