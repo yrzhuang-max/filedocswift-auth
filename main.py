@@ -17,7 +17,6 @@ import logging
 import asyncio
 import time
 import re
-import stripe
 from app.core.security import get_current_user, dep_current_user
 from app.core.config import ACCESS_TOKEN_EXPIRE_DELTA,SECRET_KEY, ALGORITHM
 from app.core.jwt_utils import create_access_token, decode_access_token
